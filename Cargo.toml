@@ -1,0 +1,20 @@
+[package]
+name = "staking-para-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+env_logger = "0.9.0"
+color-eyre = "0.5.11"
+structopt = "0.3.25"
+
+subxt = { version = "0.34.0" }
+subxt-signer = { version = "0.34.0" }
+tokio = { version = "1.14.0", features = ["macros", "rt-multi-thread"] }
+
+sp-runtime = { path = "../polkadot-sdk/substrate/primitives/runtime" }
+sp-core = { path = "../polkadot-sdk/substrate/primitives/core" }
+
+[[bin]]
+name = "staking-cli"
+path = "src/main.rs"
