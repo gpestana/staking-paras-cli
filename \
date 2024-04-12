@@ -1,0 +1,241 @@
+#[subxt::subxt(
+    runtime_metadata_path = "./artifacts/staking-parachain.scale",
+    derive_for_type(path = "pallet_staking::ValidatorPrefs", derive = "Default"),
+    derive_for_type(path = "sp_arithmetic::per_things::Perbill", derive = "Default"),
+    derive_for_all_types = "Debug"
+)]
+pub mod staking_parachain {}
+
+use structopt::StructOpt;
+
+use subxt::{OnlineClient, SubstrateConfig};
+use subxt_signer::sr25519::dev;
+
+use rand::prelude::*;
+
+use crate::staking_parachain::runtime_types::{
+    pallet_staking::RewardDestination,
+    pallet_balances::pallet::Call,
+};
+
+/// CLI for easy interaction with the staking-parachain.
+#[derive(Debug, StructOpt)]
+struct Opts {
+    #[structopt(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, StructOpt, Clone)]
+enum Command {
+    // Populate staking validators.
+    #[structopt(name = "validate")]
+    Validate {
+        /// The id of the destination parachain.
+        #[structopt(long, default_value = "2000")]
+        parachain_id: u32,
+        /// The number  of new validators.
+        #[structopt(long, default_value = "10")]
+        number: usize,
+        /// RPC and signer configs.
+        #[structopt(flatten)]
+        configs: Configs,
+    },
+    #[structopt(name = "nominate")]
+    Nominate {
+        /// The id of the destination parachain.
+        #[structopt(long, default_value = "2000")]
+        parachain_id: u32,
+        /// The number  of new validators.
+        #[structopt(long, default_value = "10")]
+        number: usize,
+        /// The approx number of nominations per voter.
+        #[structopt(long, default_value = "6")]
+        nominations: usize,
+        /// RPC and signer configs.
+        #[structopt(flatten)]
+        configs: Configs,
+    },
+}
+
+/// Arguments required for creating and sending an extrinsic to a substrate node.
+#[derive(Clone, Debug, StructOpt)]
+pub(crate) struct Configs {
+    /// RPC endpoint for the collator.
+    #[structopt(name = "url", long, short)]
+    url: String,
+}
+
+#[tokio::main]
+async fn main() -> color_eyre::Result<()> {
+    env_logger::init();
+    color_eyre::install()?;
+
+    let _configs = match Opts::from_args().command {
+        Command::Validate {
+            parachain_id,
+            number,
+            configs,
+        } => commands::validate(parachain_id, number, configs).await,
+        Command::Nominate {
+            parachain_id,
+            number,
+            nominations,
+            configs,
+        } => commands::nominate(parachain_id, number, nominations, configs).await,
+        Command::RandomNominations {
+            parachain_id,
+            number_validators,
+            number_nominators,
+            configs,
+        } => commands::add_random_nominations(parachain_id, number_validators, number_nominators, configs).await,
+    }?;
+
+    // do somehting now with configs?
+
+    Ok(())
+}
+
+mod commands {
+    use super::*;
+    use staking_parachain::runtime_types::staking_rococo_runtime::RuntimeCall;
+    use subxt_signer::sr25519::Keypair;
+
+    /// Adds new `n_validators` validators and new `n_nominators` with random nominations on the
+    /// new validators. The nominator and validator accounts are created from the 0.
+    pub(crate) async fn add_random_nominations(
+        _para_id: u32,
+        n_validators: usize,
+        _n_nominators: usize,
+        configs: Configs,
+    ) -> color_eyre::Result<Configs> {
+        let api = OnlineClient::<SubstrateConfig>::from_url(&configs.url).await?;
+
+        println!("> Generating, funding, bonding and setting as validators {n_validators} accounts..");
+
+        let ed = staking_parachain::constants()
+            .balances()
+            .existential_deposit();
+        let fund_with = api.constants().at(&ed)? * 1000;
+
+        let mut validators: Vec<Keypair> = vec![];
+
+        let mut mint_calls: Vec<RuntimeCall> = vec![];
+        let mut bond_calls = vec![];
+        let mut validate_calls = vec![];
+
+        // generate validators:
+        // - generate random keypair
+        // - funds account
+        // - submit `Call::bond` and `Call::validate` for each generated account
+        for _n in 0..n_validators {
+            let mut rng = rand::thread_rng();
+            let seed: usize = rng.gen();
+            let pair = helpers::signer_from_seed(&seed.to_string());
+            let amount = fund_with / 10;
+
+            validators.push(pair.clone());
+
+            let mint_call = Call::transfer_allow_death { dest: pair.public_key().into(), value: fund_with };
+            mint_calls.push(RuntimeCall::Balances(mint_call));
+
+            let bond_tx = staking_parachain::tx().staking().bond(amount, RewardDestination::Staked);
+            bond_calls.push((pair.clone(), bond_tx));
+
+            let validate_tx = staking_parachain::tx().staking().validate(Default::default());
+            validate_calls.push((pair, validate_tx));
+        }
+
+        let tx = staking_parachain::tx()
+            .utility()
+            .batch(mint_calls);
+        let mut progress = api.tx().sign_and_submit_then_watch_default(&tx, &dev::alice()).await?;
+        // make sure all mints went through before progressing.
+        while let Some(_) = progress.next().await {};
+        println!("Minting done for {n_validators} stakers.");
+
+        let mut it = bond_calls.into_iter().peekable();
+        while let Some(next) = it.next() {
+            let (pair, bond_tx) = next;
+            let mut progress = api.tx().sign_and_submit_then_watch_default(&bond_tx, &pair).await?;
+            // make sure all bonds went through before progressing.
+            if it.peek().is_none() {
+                while let Some(_) = progress.next().await {};
+            }
+        }
+        println!("Bonding done for {n_validators} stakers.");
+
+        let mut it = validate_calls.into_iter().peekable();
+        while let Some(next) = it.next() {
+            let (pair, validate_tx) = next;
+            let mut progress = api.tx().sign_and_submit_then_watch_default(&validate_tx, &pair).await?;
+            // make sure all bonds went through before progressing.
+            if it.peek().is_none() {
+                while let Some(_) = progress.next().await {};
+            }
+        }
+        println!("Validating done for {n_validators} stakers.");
+
+        Ok(configs)
+    }
+
+    /// Implements the validate command.
+    pub(crate) async fn validate(
+        _para_id: u32,
+        number: usize,
+        configs: Configs,
+    ) -> color_eyre::Result<Configs> {
+        let api = OnlineClient::<SubstrateConfig>::from_url(&configs.url).await?;
+
+        let ed = staking_parachain::constants()
+            .balances()
+            .existential_deposit();
+        let fund_with = api.constants().at(&ed)? * 10;
+
+        let mut txs = vec![];
+
+        // create accounts.
+        for seed in 0..number {
+            let pair = helpers::signer_from_seed(&seed.to_string());
+
+            let mint_into_tx = staking_parachain::tx()
+                .balances()
+                .transfer_allow_death(pair.public_key().into(), fund_with);
+
+            txs.push(mint_into_tx);
+
+            //let bound_tx = staking_parachain::tx()
+            //   .staking()
+            //    .bond(balance, RewardDestination::Staked);
+            //let validate_tx = staking_parachain::tx()
+            //    .staking()
+            //    .validate(Default::default());
+        }
+        //let tx = staking_parachain::tx().utility().batch(txs);
+        //let hash = api.tx().sign_and_submit_default(&tx, &dev::alice()).await?;
+
+        Ok(configs)
+    }
+
+    /// Implements the nominate command.
+    pub(crate) async fn nominate(
+        _para_id: u32,
+        _number: usize,
+        _nominations: usize,
+        configs: Configs,
+    ) -> color_eyre::Result<Configs> {
+        Ok(configs)
+    }
+}
+
+mod helpers {
+    use std::io::Write;
+    use subxt_signer::sr25519::Keypair;
+
+    pub(crate) fn signer_from_seed(init_seed: &str) -> Keypair {
+        let mut seed = [0; 32];
+        let mut buffer = &mut seed[..];
+        buffer.write(init_seed.as_bytes()).unwrap();
+
+        Keypair::from_seed(seed).expect("generate keypair should be ok")
+    }
+}

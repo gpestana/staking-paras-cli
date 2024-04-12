@@ -9,11 +9,13 @@ color-eyre = "0.5.11"
 structopt = "0.3.25"
 
 subxt = { version = "0.34.0" }
-subxt-signer = { version = "0.34.0" }
+subxt-signer = { version = "0.34.0", features = ["subxt"] }
 tokio = { version = "1.14.0", features = ["macros", "rt-multi-thread"] }
 
 sp-runtime = { path = "../polkadot-sdk/substrate/primitives/runtime" }
 sp-core = { path = "../polkadot-sdk/substrate/primitives/core" }
+rand = "0.8.5"
+hex = "0.4.3"
 
 [[bin]]
 name = "staking-cli"
