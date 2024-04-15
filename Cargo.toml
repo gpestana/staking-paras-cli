@@ -15,7 +15,9 @@ tokio = { version = "1.14.0", features = ["macros", "rt-multi-thread"] }
 sp-runtime = { path = "../polkadot-sdk/substrate/primitives/runtime" }
 sp-core = { path = "../polkadot-sdk/substrate/primitives/core" }
 rand = "0.8.5"
-hex = "0.4.3"
+hex = {version = "0.4.3", features = ["serde"] }
+serde = { version = "1.0.197", features = ["serde_derive"] }
+hex-literal = "0.4.1"
 
 [[bin]]
 name = "staking-cli"

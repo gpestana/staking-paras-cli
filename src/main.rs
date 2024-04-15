@@ -10,18 +10,21 @@ use rand::prelude::*;
 use structopt::StructOpt;
 
 use subxt::{
-    utils::{AccountId32, MultiAddress},
+    utils::{AccountId32, MultiAddress, MultiAddress::Id},
     OnlineClient, SubstrateConfig,
 };
 use subxt_signer::sr25519::dev;
 
-use crate::staking_parachain::runtime_types::{
-    pallet_balances::pallet::Call as BalancesCall, pallet_staking::RewardDestination,
-    staking_rococo_runtime::RuntimeCall,
+use crate::staking_parachain::{
+    runtime_types::{
+        pallet_balances::pallet::Call as BalancesCall, pallet_staking::RewardDestination,
+        sp_arithmetic::per_things::Perbill, staking_rococo_runtime::RuntimeCall,
+    },
+    staking::calls::types::nominate::Targets,
 };
 
 type Balance = u128; // fetch from Metadata
-type ValidatorAccount = MultiAddress<AccountId32, ()>;
+type Target = MultiAddress<AccountId32, ()>;
 
 /// CLI for easy interaction with the staking-parachain.
 #[derive(Debug, StructOpt)]
@@ -44,6 +47,8 @@ enum Command {
         /// Balance to bond with
         #[structopt(long, default_value = "1000000000000")]
         bond_amount: Balance,
+        #[structopt(long)]
+        alice: bool,
         /// RPC and signer configs.
         #[structopt(flatten)]
         configs: Configs,
@@ -62,12 +67,19 @@ enum Command {
         /// The approx number of nominations per voter.
         #[structopt(long, default_value = "6")]
         nominations: usize,
+        #[structopt(long)]
+        alice: bool,
         /// RPC and signer configs.
         #[structopt(flatten)]
         configs: Configs,
     },
     #[structopt(name = "stakers_info")]
     StakersInfo {
+        #[structopt(flatten)]
+        configs: Configs,
+    },
+    #[structopt(name = "playground")]
+    Playground {
         #[structopt(flatten)]
         configs: Configs,
     },
@@ -91,16 +103,29 @@ async fn main() -> color_eyre::Result<()> {
             parachain_id,
             number,
             bond_amount,
+            alice,
             configs,
-        } => commands::validate(parachain_id, number, bond_amount, configs).await,
+        } => commands::validate(parachain_id, number, bond_amount, alice, configs).await,
         Command::Nominate {
             parachain_id,
             number,
             bond_amount,
             nominations,
+            alice,
             configs,
-        } => commands::nominate(parachain_id, number, bond_amount, nominations, configs).await,
+        } => {
+            commands::nominate(
+                parachain_id,
+                number,
+                bond_amount,
+                nominations,
+                alice,
+                configs,
+            )
+            .await
+        }
         Command::StakersInfo { configs } => commands::stakers_info(configs).await,
+        Command::Playground { configs } => commands::playground(configs).await,
     }?;
 
     Ok(())
@@ -114,16 +139,24 @@ mod commands {
         _para_id: u32,
         n_validators: usize,
         bond_amount: Balance,
+        alice: bool,
         configs: Configs,
     ) -> color_eyre::Result<Configs> {
         let api = OnlineClient::<SubstrateConfig>::from_url(&configs.url).await?;
 
-        println!(
-            "> Generating and funding, bonding and setting as validators {n_validators} accounts.."
-        );
-
-        let keypairs = helpers::fund_accounts(&api, n_validators, Some(bond_amount * 2)).await?;
-        println!("Minting done for {n_validators} stakers.");
+        let keypairs = if alice {
+            println!("> Bonding and setting Alice as validator..");
+            vec![dev::alice()]
+        } else {
+            println!(
+                "> Generating and funding, bonding and setting as validators {n_validators} accounts.."
+            );
+            let keypairs =
+                helpers::fund_accounts(&api, n_validators, Some(bond_amount * 2)).await?;
+            println!("Minting done for {n_validators} stakers.");
+            keypairs
+        };
+        let n_validators = keypairs.len();
 
         let mut bond_calls: Vec<(_, _)> = vec![];
         let mut validate_calls: Vec<(_, _)> = vec![];
@@ -133,10 +166,12 @@ mod commands {
             let bond_tx = staking_parachain::tx()
                 .staking()
                 .bond(bond_amount, RewardDestination::Staked);
-            let validate_tx = staking_parachain::tx()
-                .staking()
-                .validate(Default::default());
-
+            let validate_tx = staking_parachain::tx().staking().validate(
+                staking_parachain::runtime_types::pallet_staking::ValidatorPrefs {
+                    commission: Perbill(10),
+                    blocked: false,
+                },
+            );
             bond_calls.push((pair.clone(), bond_tx));
             validate_calls.push((pair, validate_tx));
         }
@@ -153,7 +188,7 @@ mod commands {
                 while let Some(_) = progress.next().await {}
             }
         }
-        println!("Bonding done for {n_validators} stakers.");
+        println!("Bonding done for {n_validators} staker(s).");
 
         let mut it = validate_calls.into_iter().peekable();
         while let Some(next) = it.next() {
@@ -167,7 +202,8 @@ mod commands {
                 while let Some(_) = progress.next().await {}
             }
         }
-        println!("Validating done for {n_validators} stakers.");
+        println!("Validating done for {n_validators} staker(s).");
+        let configs = stakers_info(configs).await?;
 
         Ok(configs)
     }
@@ -178,30 +214,41 @@ mod commands {
         n_nominators: usize,
         bond_amount: Balance,
         nominations: usize,
+        alice: bool,
         configs: Configs,
     ) -> color_eyre::Result<Configs> {
         let api = OnlineClient::<SubstrateConfig>::from_url(&configs.url).await?;
 
-        println!(
-            "> Generating and funding, bonding and setting as nominators {n_nominators} accounts.."
-        );
+        let current_validators = helpers::get_validators(&api).await?;
 
-        let keypairs = helpers::fund_accounts(&api, n_nominators, Some(bond_amount * 2)).await?;
+        let (targets, keypairs) = if alice {
+            println!("> Bonding and setting Alice as nominator..");
+            let alice_target: Target = dev::alice().public_key().into();
+
+            (vec![alice_target], vec![dev::alice()])
+        } else {
+            println!(
+                "> Generating and funding, bonding and setting as nominators {n_nominators} accounts.."
+            );
+            let targets = helpers::select_targets(nominations, current_validators.clone());
+            let keypairs =
+                helpers::fund_accounts(&api, n_nominators, Some(bond_amount * 2)).await?;
+
+            (targets, keypairs)
+        };
+
+        let n_nominators = keypairs.len();
         println!("Minting done for {n_nominators} stakers.");
 
         let mut bond_calls: Vec<(_, _)> = vec![];
         let mut nominate_calls: Vec<(_, _)> = vec![];
 
-        let current_validators = helpers::get_validators(&api).await?;
-
         // prepare both bond and nominate calls for generated & funded keypairs.
         for pair in keypairs.into_iter() {
-            let targets = helpers::select_targets(nominations, &current_validators);
-
             let bond_tx = staking_parachain::tx()
                 .staking()
                 .bond(bond_amount, RewardDestination::Staked);
-            let nominate_tx = staking_parachain::tx().staking().nominate(targets);
+            let nominate_tx = staking_parachain::tx().staking().nominate(targets.clone());
 
             bond_calls.push((pair.clone(), bond_tx));
             nominate_calls.push((pair, nominate_tx));
@@ -219,13 +266,11 @@ mod commands {
                 while let Some(_) = progress.next().await {}
             }
         }
-        println!("Bonding done for {n_nominators} stakers.");
+        println!("Bonding done for {n_nominators} staker(s).");
 
         let mut it = nominate_calls.into_iter().peekable();
         while let Some(next) = it.next() {
             let (pair, nominate_tx) = next;
-
-            println!("{:?}, {:?}\n", nominate_tx, pair);
             let mut progress = api
                 .tx()
                 .sign_and_submit_then_watch_default(&nominate_tx, &pair)
@@ -235,7 +280,8 @@ mod commands {
                 while let Some(_) = progress.next().await {}
             }
         }
-        println!("Nominations done for {n_nominators} stakers.");
+        println!("Nominations done for {n_nominators} staker(s).");
+        let configs = stakers_info(configs).await?;
 
         Ok(configs)
     }
@@ -251,6 +297,12 @@ mod commands {
         println!(" {:?} validators registered.", validators.len());
         println!(" {:?} nominators registered.", nominators.len());
 
+        Ok(configs)
+    }
+
+    pub(crate) async fn playground(configs: Configs) -> color_eyre::Result<Configs> {
+        let api = OnlineClient::<SubstrateConfig>::from_url(&configs.url).await?;
+        let _current_validators = helpers::get_validators(&api).await?;
         Ok(configs)
     }
 }
@@ -306,16 +358,17 @@ mod helpers {
     /// Fetches all validators registered in the system.
     pub(crate) async fn get_validators(
         api: &OnlineClient<SubstrateConfig>,
-    ) -> color_eyre::Result<Vec<ValidatorAccount>> {
+    ) -> color_eyre::Result<Targets> {
         let mut validators = vec![];
         let storage_query = staking_parachain::storage().staking().validators_iter();
 
         let mut results = api.storage().at_latest().await?.iter(storage_query).await?;
         while let Some(Ok(kv)) = results.next().await {
             let (k, _) = kv;
-            let account: Vec<u8> = k.into_iter().rev().take(32).collect();
+            let account: Vec<u8> = k.into_iter().rev().take(32).rev().collect();
             let account: [u8; 32] = account.try_into().expect("32 bytes should fit");
-            let maddress: MultiAddress<AccountId32, ()> = MultiAddress::Address32(account);
+            let maddress = Id(AccountId32(account));
+
             validators.push(maddress);
         }
 
@@ -325,7 +378,7 @@ mod helpers {
     /// Fetches all the nominators registered in the systen.
     pub(crate) async fn get_nominators(
         api: &OnlineClient<SubstrateConfig>,
-    ) -> color_eyre::Result<Vec<ValidatorAccount>> {
+    ) -> color_eyre::Result<Targets> {
         let mut nominators = vec![];
         let storage_query = staking_parachain::storage().staking().nominators_iter();
 
@@ -342,10 +395,7 @@ mod helpers {
     }
 
     /// Selects a random `n` number of targets from a vec of validators.
-    pub(crate) fn select_targets(
-        n: usize,
-        validators: &Vec<ValidatorAccount>,
-    ) -> Vec<ValidatorAccount> {
+    pub(crate) fn select_targets(n: usize, validators: Targets) -> Targets {
         validators
             .choose_multiple(&mut rand::thread_rng(), n)
             .cloned()
